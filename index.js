@@ -24,6 +24,45 @@ app.use(express.json())
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key'
 
+// Создание таблиц
+const initDB = async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(255) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                role VARCHAR(50) NOT NULL DEFAULT 'brigadier' CHECK (role IN ('admin', 'brigadier')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS questionnaires (
+                id SERIAL PRIMARY KEY,
+                title VARCHAR(255) NOT NULL,
+                address VARCHAR(500),
+                phone VARCHAR(50),
+                status VARCHAR(100) NOT NULL DEFAULT 'created' CHECK (status IN ('created', 'processing', 'completed')),
+                created_by INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS materials (
+                id SERIAL PRIMARY KEY,
+                questionnaire_id INTEGER REFERENCES questionnaires(id) ON DELETE CASCADE,
+                name VARCHAR(255) NOT NULL,
+                quantity INTEGER NOT NULL,
+                unit VARCHAR(100) NOT NULL,
+                article INTEGER NOT NULL
+            );
+        `)
+        console.log('Таблицы созданы или уже существуют')
+    } catch (err) {
+        console.error('Ошибка при создании таблиц:', err)
+    }
+}
+
+initDB()
 
 // Middleware для аутентификации
 const authenticateToken = (req, res, next) => {
@@ -51,39 +90,7 @@ const requireAdmin = (req, res, next) => {
     next()
 }
 
-// Middleware для проверки доступа к анкете
-const checkQuestionnaireAccess = async (req, res, next) => {
-    const questionnaireId = req.params.id
-    const userId = req.user.userId
-    const userRole = req.user.role
-
-    try {
-        const questionnaire = await pool.query('SELECT * FROM questionnaires WHERE id = $1', [questionnaireId])
-
-        if (questionnaire.rows.length === 0) {
-            return res.status(404).json({ message: 'Анкета не найдена' })
-        }
-
-        // Админы могут редактировать все анкеты
-        if (userRole === 'admin') {
-            req.questionnaire = questionnaire.rows[0]
-            return next()
-        }
-
-        // Бригадиры могут редактировать только свои анкеты
-        if (questionnaire.rows[0].created_by === userId) {
-            req.questionnaire = questionnaire.rows[0]
-            return next()
-        }
-
-        return res.status(403).json({ message: 'Доступ запрещен. Вы можете редактировать только свои анкеты' })
-    } catch (err) {
-        console.error('Ошибка при проверке доступа:', err)
-        res.status(500).json({ message: 'Ошибка сервера' })
-    }
-}
-
-// Регистрация пользователя
+// Регистрация
 app.post('/register', async (req, res) => {
     const { username, password, role } = req.body
 
@@ -91,7 +98,6 @@ app.post('/register', async (req, res) => {
         return res.status(400).json({ message: 'Логин и пароль обязательны' })
     }
 
-    // По умолчанию роль "бригадир", если не указана другая
     const userRole = role || 'brigadier'
 
     if (!['admin', 'brigadier'].includes(userRole)) {
@@ -99,16 +105,13 @@ app.post('/register', async (req, res) => {
     }
 
     try {
-        // Проверяем, существует ли уже такой пользователь
         const existingUser = await pool.query('SELECT * FROM users WHERE username = $1', [username])
         if (existingUser.rows.length > 0) {
             return res.status(400).json({ message: 'Пользователь с таким логином уже существует' })
         }
 
-        // Хешируем пароль
         const hashedPassword = await bcrypt.hash(password, 10)
 
-        // Создаем пользователя
         const newUser = await pool.query(
             'INSERT INTO users (username, password, role) VALUES ($1, $2, $3) RETURNING id, username, role',
             [username, hashedPassword, userRole]
@@ -133,7 +136,6 @@ app.post('/login', async (req, res) => {
     }
 
     try {
-        // Ищем пользователя
         const userQuery = await pool.query('SELECT * FROM users WHERE username = $1', [username])
         const user = userQuery.rows[0]
 
@@ -141,30 +143,20 @@ app.post('/login', async (req, res) => {
             return res.status(401).json({ message: 'Неверный логин или пароль' })
         }
 
-        // Проверяем пароль
         const validPassword = await bcrypt.compare(password, user.password)
         if (!validPassword) {
             return res.status(401).json({ message: 'Неверный логин или пароль' })
         }
 
-        // Создаем JWT-токен
         const token = jwt.sign(
-            {
-                userId: user.id,
-                username: user.username,
-                role: user.role
-            },
+            { userId: user.id, username: user.username, role: user.role },
             JWT_SECRET,
-            { expiresIn: '168h' } // Неделя
+            { expiresIn: '168h' }
         )
 
         res.json({
             token,
-            user: {
-                id: user.id,
-                username: user.username,
-                role: user.role
-            }
+            user: { id: user.id, username: user.username, role: user.role }
         })
     } catch (err) {
         console.error('Ошибка при авторизации:', err)
@@ -172,53 +164,72 @@ app.post('/login', async (req, res) => {
     }
 })
 
-// Создание анкеты
+// Создание анкеты с материалами
 app.post('/questionnaires', authenticateToken, async (req, res) => {
-    const { materials, quantity, unit, article, status } = req.body
+    const { title, address, phone, materials } = req.body
     const userId = req.user.userId
 
-    if (!materials || quantity === undefined || !unit || article === undefined) {
-        return res.status(400).json({
-            message: 'Все поля обязательны: materials, quantity, unit, article'
-        })
+    if (!title || !materials || !Array.isArray(materials) || materials.length === 0) {
+        return res.status(400).json({ message: 'Название и хотя бы один материал обязательны' })
     }
 
-    const questionnaireStatus = status || 'created'
+    const client = await pool.connect()
 
     try {
-        const newQuestionnaire = await pool.query(
-            `INSERT INTO questionnaires (materials, quantity, unit, article, status, created_by) 
-             VALUES ($1, $2, $3, $4, $5, $6) 
-             RETURNING *`,
-            [materials, quantity, unit, article, questionnaireStatus, userId]
+        await client.query('BEGIN')
+
+        // Создаём анкету
+        const questionnaireResult = await client.query(
+            `INSERT INTO questionnaires (title, address, phone, created_by) 
+             VALUES ($1, $2, $3, $4) RETURNING *`,
+            [title, address || null, phone || null, userId]
         )
+        const questionnaire = questionnaireResult.rows[0]
+
+        // Добавляем материалы
+        const materialPromises = materials.map(material =>
+            client.query(
+                `INSERT INTO materials (questionnaire_id, name, quantity, unit, article) 
+                 VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+                [questionnaire.id, material.name, material.quantity, material.unit, material.article]
+            )
+        )
+        const materialResults = await Promise.all(materialPromises)
+        const insertedMaterials = materialResults.map(r => r.rows[0])
+
+        await client.query('COMMIT')
 
         res.status(201).json({
-            message: 'Анкета успешно создана',
-            questionnaire: newQuestionnaire.rows[0]
+            ...questionnaire,
+            materials: insertedMaterials
         })
     } catch (err) {
+        await client.query('ROLLBACK')
         console.error('Ошибка при создании анкеты:', err)
         res.status(500).json({ message: 'Ошибка сервера' })
+    } finally {
+        client.release()
     }
 })
 
-// Получение всех анкет (с фильтрацией)
+// Получение всех анкет с материалами
 app.get('/questionnaires', authenticateToken, async (req, res) => {
     const userId = req.user.userId
     const userRole = req.user.role
 
     try {
-        let query = 'SELECT q.*, u.username as creator_name FROM questionnaires q JOIN users u ON q.created_by = u.id'
+        let query = `
+            SELECT q.*, u.username as creator_name
+            FROM questionnaires q 
+            JOIN users u ON q.created_by = u.id
+        `
         let params = []
 
-        // Админ видит все анкеты, бригадир - только свои
         if (userRole !== 'admin') {
             query += ' WHERE q.created_by = $1'
             params.push(userId)
         }
 
-        // Дополнительные фильтры
         if (req.query.status) {
             query += params.length > 0 ? ' AND' : ' WHERE'
             params.push(req.query.status)
@@ -227,81 +238,153 @@ app.get('/questionnaires', authenticateToken, async (req, res) => {
 
         query += ' ORDER BY q.created_at DESC'
 
-        const questionnaires = await pool.query(query, params)
-        res.json(questionnaires.rows)
+        const questionnairesResult = await pool.query(query, params)
+        const questionnaires = questionnairesResult.rows
+
+        // Для каждой анкеты получаем материалы
+        const result = await Promise.all(
+            questionnaires.map(async (q) => {
+                const materialsResult = await pool.query(
+                    'SELECT * FROM materials WHERE questionnaire_id = $1 ORDER BY id',
+                    [q.id]
+                )
+                return {
+                    ...q,
+                    materials: materialsResult.rows
+                }
+            })
+        )
+
+        res.json(result)
     } catch (err) {
         console.error('Ошибка при получении анкет:', err)
         res.status(500).json({ message: 'Ошибка сервера' })
     }
 })
 
-// Получение конкретной анкеты
+// Получение одной анкеты
 app.get('/questionnaires/:id', authenticateToken, async (req, res) => {
     const questionnaireId = req.params.id
     const userId = req.user.userId
     const userRole = req.user.role
 
     try {
-        const questionnaire = await pool.query(
-            'SELECT q.*, u.username as creator_name FROM questionnaires q JOIN users u ON q.created_by = u.id WHERE q.id = $1',
+        const questionnaireResult = await pool.query(
+            `SELECT q.*, u.username as creator_name 
+             FROM questionnaires q JOIN users u ON q.created_by = u.id 
+             WHERE q.id = $1`,
             [questionnaireId]
         )
 
-        if (questionnaire.rows.length === 0) {
+        if (questionnaireResult.rows.length === 0) {
             return res.status(404).json({ message: 'Анкета не найдена' })
         }
 
-        const data = questionnaire.rows[0]
+        const questionnaire = questionnaireResult.rows[0]
 
-        // Проверка доступа: админ видит все, бригадир только свои
-        if (userRole !== 'admin' && data.created_by !== userId) {
+        if (userRole !== 'admin' && questionnaire.created_by !== userId) {
             return res.status(403).json({ message: 'Доступ запрещен' })
         }
 
-        res.json(data)
+        const materialsResult = await pool.query(
+            'SELECT * FROM materials WHERE questionnaire_id = $1 ORDER BY id',
+            [questionnaireId]
+        )
+
+        res.json({
+            ...questionnaire,
+            materials: materialsResult.rows
+        })
     } catch (err) {
         console.error('Ошибка при получении анкеты:', err)
         res.status(500).json({ message: 'Ошибка сервера' })
     }
 })
 
-// Обновление анкеты
-app.put('/questionnaires/:id', authenticateToken, checkQuestionnaireAccess, async (req, res) => {
+// Обновление анкеты и материалов
+app.put('/questionnaires/:id', authenticateToken, async (req, res) => {
     const questionnaireId = req.params.id
-    const { materials, quantity, unit, article, status } = req.body
+    const userId = req.user.userId
+    const userRole = req.user.role
+    const { title, address, phone, status, materials } = req.body
+
+    const client = await pool.connect()
 
     try {
-        const currentQuestionnaire = req.questionnaire
+        // Проверяем существование и доступ
+        const checkResult = await client.query('SELECT * FROM questionnaires WHERE id = $1', [questionnaireId])
+        if (checkResult.rows.length === 0) {
+            return res.status(404).json({ message: 'Анкета не найдена' })
+        }
+        if (userRole !== 'admin' && checkResult.rows[0].created_by !== userId) {
+            return res.status(403).json({ message: 'Доступ запрещен' })
+        }
 
-        const updatedMaterials = materials || currentQuestionnaire.materials
-        const updatedQuantity = quantity !== undefined ? quantity : currentQuestionnaire.quantity
-        const updatedUnit = unit || currentQuestionnaire.unit
-        const updatedArticle = article !== undefined ? article : currentQuestionnaire.article
-        const updatedStatus = status || currentQuestionnaire.status
+        await client.query('BEGIN')
 
-        const updatedQuestionnaire = await pool.query(
+        // Обновляем анкету
+        const updateResult = await client.query(
             `UPDATE questionnaires 
-             SET materials = $1, quantity = $2, unit = $3, article = $4, status = $5, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $6 
+             SET title = COALESCE($1, title),
+                 address = COALESCE($2, address),
+                 phone = COALESCE($3, phone),
+                 status = COALESCE($4, status),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $5
              RETURNING *`,
-            [updatedMaterials, updatedQuantity, updatedUnit, updatedArticle, updatedStatus, questionnaireId]
+            [title, address, phone, status, questionnaireId]
+        )
+
+        // Если переданы материалы — удаляем старые и вставляем новые
+        if (materials && Array.isArray(materials)) {
+            await client.query('DELETE FROM materials WHERE questionnaire_id = $1', [questionnaireId])
+
+            const materialPromises = materials.map(material =>
+                client.query(
+                    `INSERT INTO materials (questionnaire_id, name, quantity, unit, article) 
+                     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+                    [questionnaireId, material.name, material.quantity, material.unit, material.article]
+                )
+            )
+            await Promise.all(materialPromises)
+        }
+
+        await client.query('COMMIT')
+
+        // Возвращаем обновлённую анкету с материалами
+        const materialsResult = await client.query(
+            'SELECT * FROM materials WHERE questionnaire_id = $1 ORDER BY id',
+            [questionnaireId]
         )
 
         res.json({
-            message: 'Анкета успешно обновлена',
-            questionnaire: updatedQuestionnaire.rows[0]
+            ...updateResult.rows[0],
+            materials: materialsResult.rows
         })
     } catch (err) {
+        await client.query('ROLLBACK')
         console.error('Ошибка при обновлении анкеты:', err)
         res.status(500).json({ message: 'Ошибка сервера' })
+    } finally {
+        client.release()
     }
 })
 
 // Удаление анкеты
-app.delete('/questionnaires/:id', authenticateToken, checkQuestionnaireAccess, async (req, res) => {
+app.delete('/questionnaires/:id', authenticateToken, async (req, res) => {
     const questionnaireId = req.params.id
+    const userId = req.user.userId
+    const userRole = req.user.role
 
     try {
+        const checkResult = await pool.query('SELECT * FROM questionnaires WHERE id = $1', [questionnaireId])
+        if (checkResult.rows.length === 0) {
+            return res.status(404).json({ message: 'Анкета не найдена' })
+        }
+        if (userRole !== 'admin' && checkResult.rows[0].created_by !== userId) {
+            return res.status(403).json({ message: 'Доступ запрещен' })
+        }
+
         await pool.query('DELETE FROM questionnaires WHERE id = $1', [questionnaireId])
         res.json({ message: 'Анкета успешно удалена' })
     } catch (err) {
@@ -310,7 +393,7 @@ app.delete('/questionnaires/:id', authenticateToken, checkQuestionnaireAccess, a
     }
 })
 
-// Получение списка пользователей (только для админов)
+// Список пользователей (админ)
 app.get('/users', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const users = await pool.query(
@@ -323,7 +406,7 @@ app.get('/users', authenticateToken, requireAdmin, async (req, res) => {
     }
 })
 
-// Изменение роли пользователя (только для админов)
+// Изменение роли (админ)
 app.put('/users/:id/role', authenticateToken, requireAdmin, async (req, res) => {
     const userId = req.params.id
     const { role } = req.body
@@ -342,17 +425,13 @@ app.put('/users/:id/role', authenticateToken, requireAdmin, async (req, res) => 
             return res.status(404).json({ message: 'Пользователь не найден' })
         }
 
-        res.json({
-            message: 'Роль пользователя обновлена',
-            user: updatedUser.rows[0]
-        })
+        res.json({ message: 'Роль пользователя обновлена', user: updatedUser.rows[0] })
     } catch (err) {
         console.error('Ошибка при изменении роли:', err)
         res.status(500).json({ message: 'Ошибка сервера' })
     }
 })
 
-// Тестовые эндпоинты
 app.get('/test', (req, res) => {
     res.json({ message: 'API работает!' })
 })
