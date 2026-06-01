@@ -5,15 +5,11 @@ const jwt = require('jsonwebtoken')
 const bcrypt = require('bcrypt')
 require('dotenv').config()
 
-// Функция генерации PDF
 const PDFDocument = require('pdfkit');
 const path = require('path');
-
-// Путь к шрифту с поддержкой кириллицы
 const FONT_PATH = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 const nodemailer = require('nodemailer');
 
-// Настройка почты
 const transporter = nodemailer.createTransport({
     host: process.env.EMAIL_HOST,
     port: process.env.EMAIL_PORT,
@@ -24,7 +20,6 @@ const transporter = nodemailer.createTransport({
     },
 });
 
-// Функция генерации PDF
 const generatePDF = (questionnaire) => {
     return new Promise((resolve, reject) => {
         const doc = new PDFDocument({ size: 'A4', margin: 50 });
@@ -34,54 +29,75 @@ const generatePDF = (questionnaire) => {
         doc.on('end', () => resolve(Buffer.concat(buffers)));
         doc.on('error', reject);
 
-        // Регистрируем шрифт
         doc.registerFont('DejaVu', FONT_PATH);
 
-        // Заголовок
         doc.font('DejaVu', 18).text('ЗАЯВКА НА МАТЕРИАЛЫ', { align: 'center' });
         doc.moveDown(0.5);
 
-        // Информация о заявке
-        doc.font('DejaVu', 12);
+        doc.font('DejaVu', 11);
         doc.text(`Тип работ: ${questionnaire.work_type}`);
         doc.text(`Адрес: ${questionnaire.address}`);
         doc.text(`Телефон: ${questionnaire.phone || '—'}`);
         doc.text(`Дата: ${new Date(questionnaire.created_at).toLocaleString('ru-RU')}`);
         doc.moveDown();
 
-        // Таблица материалов
         doc.font('DejaVu', 14).text('МАТЕРИАЛЫ:', { underline: true });
         doc.moveDown(0.5);
 
+        // Ширина колонок
+        const col1 = 30;  // №
+        const col2 = 55;  // Наименование (начало)
+        const col3 = 310; // Кол-во
+        const col4 = 370; // Ед.
+        const col5 = 410; // Артикул
+
+        const col2Width = col3 - col2 - 5; // Ширина для названия
+
         // Заголовки таблицы
-        doc.font('DejaVu', 10);
+        doc.font('DejaVu', 9);
         const tableTop = doc.y;
-        doc.text('№', 50, tableTop);
-        doc.text('Наименование', 80, tableTop, { width: 260 });
-        doc.text('Кол-во', 350, tableTop, { width: 60, align: 'right' });
-        doc.text('Ед.', 420, tableTop, { width: 40, align: 'right' });
-        doc.text('Артикул', 470, tableTop, { width: 60, align: 'right' });
+        doc.text('№', col1, tableTop, { width: 25 });
+        doc.text('Наименование', col2, tableTop, { width: col2Width });
+        doc.text('Кол-во', col3, tableTop, { width: 50, align: 'right' });
+        doc.text('Ед.', col4, tableTop, { width: 30, align: 'right' });
+        doc.text('Артикул', col5, tableTop, { width: 55, align: 'right' });
 
         // Линия
-        doc.moveTo(50, tableTop + 15).lineTo(550, tableTop + 15).stroke();
+        doc.moveTo(50, tableTop + 15).lineTo(530, tableTop + 15).stroke();
 
         // Данные таблицы
-        doc.font('DejaVu', 10);
+        doc.font('DejaVu', 8);
         let y = tableTop + 20;
+
         questionnaire.materials.forEach((material, index) => {
-            if (y > 750) {
+            // Вычисляем высоту строки в зависимости от длины названия
+            const nameHeight = doc.heightOfString(material.name, { width: col2Width });
+            const rowHeight = Math.max(16, nameHeight + 4);
+
+            // Проверяем, нужна ли новая страница
+            if (y + rowHeight > 750) {
                 doc.addPage();
                 y = 50;
             }
-            doc.text(`${index + 1}`, 50, y);
-            doc.text(material.name, 80, y, { width: 260 });
-            doc.text(`${material.quantity}`, 350, y, { width: 60, align: 'right' });
-            doc.text(material.unit, 420, y, { width: 40, align: 'right' });
-            doc.text(`${material.article}`, 470, y, { width: 60, align: 'right' });
-            y += 18;
+
+            // Номер
+            doc.text(`${index + 1}`, col1, y, { width: 25 });
+            // Наименование
+            doc.text(material.name, col2, y, { width: col2Width });
+            // Кол-во
+            doc.text(`${material.quantity}`, col3, y, { width: 50, align: 'right' });
+            // Ед.
+            doc.text(material.unit, col4, y, { width: 30, align: 'right' });
+            // Артикул
+            doc.text(`${material.article}`, col5, y, { width: 55, align: 'right' });
+
+            // Линия между строками
+            doc.moveTo(50, y + rowHeight - 2).lineTo(530, y + rowHeight - 2).stroke('#cccccc');
+
+            y += rowHeight;
         });
 
-        doc.moveDown();
+        doc.moveDown(2);
         doc.font('DejaVu', 8).text(`Создано: ${new Date().toLocaleString('ru-RU')}`, { align: 'right' });
 
         doc.end();
