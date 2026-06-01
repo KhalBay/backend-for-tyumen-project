@@ -24,46 +24,6 @@ app.use(express.json())
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key'
 
-// Создание таблиц
-const initDB = async () => {
-    try {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username VARCHAR(255) UNIQUE NOT NULL,
-                password VARCHAR(255) NOT NULL,
-                role VARCHAR(50) NOT NULL DEFAULT 'brigadier' CHECK (role IN ('admin', 'brigadier')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS questionnaires (
-                id SERIAL PRIMARY KEY,
-                title VARCHAR(255) NOT NULL,
-                address VARCHAR(500),
-                phone VARCHAR(50),
-                status VARCHAR(100) NOT NULL DEFAULT 'created' CHECK (status IN ('created', 'processing', 'completed')),
-                created_by INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS materials (
-                id SERIAL PRIMARY KEY,
-                questionnaire_id INTEGER REFERENCES questionnaires(id) ON DELETE CASCADE,
-                name VARCHAR(255) NOT NULL,
-                quantity INTEGER NOT NULL,
-                unit VARCHAR(100) NOT NULL,
-                article INTEGER NOT NULL
-            );
-        `)
-        console.log('Таблицы созданы или уже существуют')
-    } catch (err) {
-        console.error('Ошибка при создании таблиц:', err)
-    }
-}
-
-initDB()
-
 // Middleware для аутентификации
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization']
@@ -151,7 +111,7 @@ app.post('/login', async (req, res) => {
         const token = jwt.sign(
             { userId: user.id, username: user.username, role: user.role },
             JWT_SECRET,
-            { expiresIn: '168h' }
+            { expiresIn: '168y' }
         )
 
         res.json({
@@ -166,11 +126,11 @@ app.post('/login', async (req, res) => {
 
 // Создание анкеты с материалами
 app.post('/questionnaires', authenticateToken, async (req, res) => {
-    const { title, address, phone, materials } = req.body
+    const { work_type, address, phone, materials } = req.body
     const userId = req.user.userId
 
-    if (!title || !materials || !Array.isArray(materials) || materials.length === 0) {
-        return res.status(400).json({ message: 'Название и хотя бы один материал обязательны' })
+    if (!work_type || !address || !materials || !Array.isArray(materials) || materials.length === 0) {
+        return res.status(400).json({ message: 'Тип работы, адрес и хотя бы один материал обязательны' })
     }
 
     const client = await pool.connect()
@@ -180,9 +140,9 @@ app.post('/questionnaires', authenticateToken, async (req, res) => {
 
         // Создаём анкету
         const questionnaireResult = await client.query(
-            `INSERT INTO questionnaires (title, address, phone, created_by) 
+            `INSERT INTO questionnaires (work_type, address, phone, created_by) 
              VALUES ($1, $2, $3, $4) RETURNING *`,
-            [title, address || null, phone || null, userId]
+            [work_type, address, phone || null, userId]
         )
         const questionnaire = questionnaireResult.rows[0]
 
@@ -306,7 +266,7 @@ app.put('/questionnaires/:id', authenticateToken, async (req, res) => {
     const questionnaireId = req.params.id
     const userId = req.user.userId
     const userRole = req.user.role
-    const { title, address, phone, status, materials } = req.body
+    const { work_type, address, phone, status, materials } = req.body
 
     const client = await pool.connect()
 
@@ -325,14 +285,14 @@ app.put('/questionnaires/:id', authenticateToken, async (req, res) => {
         // Обновляем анкету
         const updateResult = await client.query(
             `UPDATE questionnaires 
-             SET title = COALESCE($1, title),
+             SET work_type = COALESCE($1, work_type),
                  address = COALESCE($2, address),
                  phone = COALESCE($3, phone),
                  status = COALESCE($4, status),
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $5
              RETURNING *`,
-            [title, address, phone, status, questionnaireId]
+            [work_type, address, phone, status, questionnaireId]
         )
 
         // Если переданы материалы — удаляем старые и вставляем новые
