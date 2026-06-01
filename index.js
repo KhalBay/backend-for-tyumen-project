@@ -5,6 +5,97 @@ const jwt = require('jsonwebtoken')
 const bcrypt = require('bcrypt')
 require('dotenv').config()
 
+const PDFDocument = require('pdfkit');
+const nodemailer = require('nodemailer');
+
+// Настройка почты
+const transporter = nodemailer.createTransport({
+    host: process.env.EMAIL_HOST,
+    port: process.env.EMAIL_PORT,
+    secure: false,
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS,
+    },
+});
+
+// Функция генерации PDF
+const generatePDF = (questionnaire) => {
+    return new Promise((resolve, reject) => {
+        const doc = new PDFDocument({ size: 'A4', margin: 50 });
+        const buffers = [];
+
+        doc.on('data', buffer => buffers.push(buffer));
+        doc.on('end', () => resolve(Buffer.concat(buffers)));
+        doc.on('error', reject);
+
+        // Заголовок
+        doc.fontSize(18).text('ЗАЯВКА НА МАТЕРИАЛЫ', { align: 'center' });
+        doc.moveDown(0.5);
+
+        // Информация о заявке
+        doc.fontSize(12).text(`Тип работ: ${questionnaire.work_type}`);
+        doc.text(`Адрес: ${questionnaire.address}`);
+        doc.text(`Телефон: ${questionnaire.phone || '—'}`);
+        doc.text(`Дата: ${new Date(questionnaire.created_at).toLocaleString('ru-RU')}`);
+        doc.moveDown();
+
+        // Таблица материалов
+        doc.fontSize(14).text('МАТЕРИАЛЫ:', { underline: true });
+        doc.moveDown(0.5);
+
+        // Заголовки таблицы
+        doc.fontSize(10);
+        const tableTop = doc.y;
+        doc.text('№', 50, tableTop);
+        doc.text('Наименование', 80, tableTop);
+        doc.text('Кол-во', 350, tableTop, { width: 60, align: 'right' });
+        doc.text('Ед.', 420, tableTop, { width: 40, align: 'right' });
+        doc.text('Артикул', 470, tableTop, { width: 60, align: 'right' });
+
+        // Линия
+        doc.moveTo(50, tableTop + 15).lineTo(550, tableTop + 15).stroke();
+
+        // Данные таблицы
+        let y = tableTop + 20;
+        questionnaire.materials.forEach((material, index) => {
+            if (y > 750) {
+                doc.addPage();
+                y = 50;
+            }
+            doc.text(`${index + 1}`, 50, y);
+            doc.text(material.name, 80, y, { width: 260 });
+            doc.text(`${material.quantity}`, 350, y, { width: 60, align: 'right' });
+            doc.text(material.unit, 420, y, { width: 40, align: 'right' });
+            doc.text(`${material.article}`, 470, y, { width: 60, align: 'right' });
+            y += 18;
+        });
+
+        doc.moveDown();
+        doc.fontSize(8).text(`Создано: ${new Date().toLocaleString('ru-RU')}`, { align: 'right' });
+
+        doc.end();
+    });
+};
+
+// Функция отправки на почту
+const sendEmail = async (pdfBuffer, questionnaire) => {
+    const mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: process.env.EMAIL_TO,
+        subject: `Новая заявка — ${questionnaire.work_type} (${questionnaire.address})`,
+        text: `Поступила новая заявка.\n\nТип работ: ${questionnaire.work_type}\nАдрес: ${questionnaire.address}\nТелефон: ${questionnaire.phone || 'не указан'}\nМатериалов: ${questionnaire.materials.length} шт.`,
+        attachments: [
+            {
+                filename: `zayavka_${questionnaire.id}.pdf`,
+                content: pdfBuffer,
+            },
+        ],
+    };
+
+    return transporter.sendMail(mailOptions);
+};
+
 const app = express()
 const port = process.env.PORT || 3001
 
@@ -126,51 +217,59 @@ app.post('/login', async (req, res) => {
 
 // Создание анкеты с материалами
 app.post('/questionnaires', authenticateToken, async (req, res) => {
-    const { work_type, address, phone, materials } = req.body
-    const userId = req.user.userId
+    const { work_type, address, phone, materials } = req.body;
+    const userId = req.user.userId;
 
     if (!work_type || !address || !materials || !Array.isArray(materials) || materials.length === 0) {
-        return res.status(400).json({ message: 'Тип работы, адрес и хотя бы один материал обязательны' })
+        return res.status(400).json({ message: 'Тип работы, адрес и хотя бы один материал обязательны' });
     }
 
-    const client = await pool.connect()
+    const client = await pool.connect();
 
     try {
-        await client.query('BEGIN')
+        await client.query('BEGIN');
 
-        // Создаём анкету
         const questionnaireResult = await client.query(
             `INSERT INTO questionnaires (work_type, address, phone, created_by) 
              VALUES ($1, $2, $3, $4) RETURNING *`,
             [work_type, address, phone || null, userId]
-        )
-        const questionnaire = questionnaireResult.rows[0]
+        );
+        const questionnaire = questionnaireResult.rows[0];
 
-        // Добавляем материалы
         const materialPromises = materials.map(material =>
             client.query(
                 `INSERT INTO materials (questionnaire_id, name, quantity, unit, article) 
                  VALUES ($1, $2, $3, $4, $5) RETURNING *`,
                 [questionnaire.id, material.name, material.quantity, material.unit, material.article]
             )
-        )
-        const materialResults = await Promise.all(materialPromises)
-        const insertedMaterials = materialResults.map(r => r.rows[0])
+        );
+        const materialResults = await Promise.all(materialPromises);
+        const insertedMaterials = materialResults.map(r => r.rows[0]);
 
-        await client.query('COMMIT')
+        await client.query('COMMIT');
+
+        // Отправляем PDF на почту (не блокируем ответ)
+        const fullQuestionnaire = {
+            ...questionnaire,
+            materials: insertedMaterials,
+        };
+
+        generatePDF(fullQuestionnaire)
+            .then(pdfBuffer => sendEmail(pdfBuffer, fullQuestionnaire))
+            .catch(err => console.error('Ошибка отправки на почту:', err));
 
         res.status(201).json({
             ...questionnaire,
-            materials: insertedMaterials
-        })
+            materials: insertedMaterials,
+        });
     } catch (err) {
-        await client.query('ROLLBACK')
-        console.error('Ошибка при создании анкеты:', err)
-        res.status(500).json({ message: 'Ошибка сервера' })
+        await client.query('ROLLBACK');
+        console.error('Ошибка при создании анкеты:', err);
+        res.status(500).json({ message: 'Ошибка сервера' });
     } finally {
-        client.release()
+        client.release();
     }
-})
+});
 
 // Получение всех анкет с материалами
 app.get('/questionnaires', authenticateToken, async (req, res) => {
