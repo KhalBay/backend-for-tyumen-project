@@ -38,7 +38,7 @@ const generatePDF = (questionnaire) => {
         doc.text(`Тип работ: ${questionnaire.work_type}`);
         doc.text(`Адрес: ${questionnaire.address}`);
         doc.text(`Телефон: ${questionnaire.phone || '—'}`);
-        doc.text(`Дата: ${new Date(questionnaire.created_at).toLocaleString('ru-RU')}`);
+        doc.text(`Заявка от: ${new Date(questionnaire.created_at).toLocaleString('ru-RU')}`);
         doc.moveDown();
 
         doc.font('DejaVu', 14).text('МАТЕРИАЛЫ:', { underline: true });
@@ -96,10 +96,6 @@ const generatePDF = (questionnaire) => {
 
             y += rowHeight;
         });
-
-        doc.moveDown(2);
-        doc.font('DejaVu', 8).text(`Создано: ${new Date().toLocaleString('ru-RU')}`, { align: 'right' });
-
         doc.end();
     });
 };
@@ -112,7 +108,9 @@ const sendEmail = async (pdfBuffer, questionnaire) => {
         from: process.env.EMAIL_USER,
         to: recipients.join(', '),
         subject: `Новая заявка — ${questionnaire.work_type} (${questionnaire.address})`,
-        text: `Поступила новая заявка.\n\nТип работ: ${questionnaire.work_type}\nАдрес: ${questionnaire.address}\nТелефон: ${questionnaire.phone || 'не указан'}\nМатериалов: ${questionnaire.materials.length} шт.`,
+        text: `Тип работ: ${questionnaire.work_type}
+                \nАдрес: ${questionnaire.address}
+                \nТелефон: ${questionnaire.phone || 'не указан'}`,
         attachments: [
             {
                 filename: `zayavka_${questionnaire.id}.pdf`,
